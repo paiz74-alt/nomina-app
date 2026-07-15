@@ -1,0 +1,577 @@
+import streamlit as st
+import pandas as pd
+import io
+import os
+import re
+from pypdf import PdfReader
+import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ----------------- CONFIGURACIÓN DE LA PÁGINA -----------------
+st.set_page_config(
+    page_title="Control de Nómina Inteligente",
+    page_icon="📈",
+    layout="wide"
+)
+
+# Estilos CSS avanzados para una interfaz moderna, limpia y ejecutiva
+st.markdown("""
+    <style>
+    /* Estilos generales */
+    .main-title { color: #1F497D; font-family: 'Segoe UI', sans-serif; font-weight: 700; margin-bottom: 2px; }
+    .subtitle { color: #595959; font-family: 'Segoe UI', sans-serif; font-style: italic; margin-bottom: 25px; }
+    
+    /* Tarjetas de Métricas de la semana seleccionada */
+    .metric-card { 
+        background-color: #F8F9FA; 
+        padding: 18px; 
+        border-radius: 10px; 
+        border-top: 5px solid #1F497D; 
+        text-align: center;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        transition: transform 0.2s;
+    }
+    .metric-card:hover { transform: translateY(-2px); }
+    .metric-val { font-size: 26px; font-weight: bold; color: #1F497D; }
+    .metric-label { font-size: 13px; color: #595959; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    
+    /* Tarjetas de Totales Anuales (Superiores) */
+    .annual-card {
+        background-color: #F0F4F8;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 5px solid #1F497D;
+        text-align: center;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    }
+    .annual-val { font-size: 22px; font-weight: bold; color: #1F497D; }
+    .annual-label { font-size: 11px; color: #4A5568; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    /* Botones y separadores */
+    .stButton>button { border-radius: 6px; font-weight: 600; }
+    hr { margin-top: 2rem; margin-bottom: 2rem; border-color: #E2E8F0; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ----------------- PERSISTENCIA DE LA BASE DE DATOS LOCAL -----------------
+DB_FILE = "nomina_db.xlsx"
+
+def load_database():
+    """Carga los datos desde el archivo local o inicializa con los datos base si no existe."""
+    if os.path.exists(DB_FILE):
+        try:
+            df = pd.read_excel(DB_FILE)
+            if "Fecha Inicio" in df.columns:
+                df["Fecha Inicio"] = df["Fecha Inicio"].astype(str)
+            if "Fecha Fin" in df.columns:
+                df["Fecha Fin"] = df["Fecha Fin"].astype(str)
+            return df
+        except Exception as e:
+            st.warning(f"No se pudo leer el archivo local '{DB_FILE}' ({e}). Cargando datos por defecto.")
+            
+    # Datos base iniciales por defecto
+    default_data = [
+        {"Fecha Inicio": "2026-06-08", "Fecha Fin": "2026-06-14", "Semana": "06/08 al 06/14", "Hrs REG": 10.0, "Hrs OT": 0.0, "Días NTP": 2, "Tarifa REG": 16.0, "Sueldo REG": 160.0, "Sueldo OT": 0.0, "Viáticos NTP": 250.0, "Pago Bruto (Gross)": 410.0, "Impuestos": 12.24, "Deducción 401-K": 0.0, "Neto Recibido": 397.76},
+        {"Fecha Inicio": "2026-06-15", "Fecha Fin": "2026-06-21", "Semana": "06/15 al 06/21", "Hrs REG": 40.0, "Hrs OT": 6.0, "Días NTP": 7, "Tarifa REG": 17.0, "Sueldo REG": 680.0, "Sueldo OT": 153.0, "Viáticos NTP": 875.0, "Pago Bruto (Gross)": 1708.0, "Impuestos": 97.34, "Deducción 401-K": 0.0, "Neto Recibido": 1622.90},
+        {"Fecha Inicio": "2026-06-22", "Fecha Fin": "2026-06-28", "Semana": "06/22 al 06/28", "Hrs REG": 40.0, "Hrs OT": 25.0, "Días NTP": 7, "Tarifa REG": 17.0, "Sueldo REG": 680.0, "Sueldo OT": 637.5, "Viáticos NTP": 875.0, "Pago Bruto (Gross)": 2192.50, "Impuestos": 175.04, "Deducción 401-K": 0.0, "Neto Recibido": 2017.46},
+        {"Fecha Inicio": "2026-06-29", "Fecha Fin": "2026-07-05", "Semana": "06/29 al 07/05", "Hrs REG": 40.0, "Hrs OT": 1.0, "Días NTP": 5, "Tarifa REG": 17.0, "Sueldo REG": 680.0, "Sueldo OT": 25.5, "Viáticos NTP": 625.0, "Pago Bruto (Gross)": 1330.50, "Impuestos": 59.77, "Deducción 401-K": 28.22, "Neto Recibido": 1242.51}
+    ]
+    df_default = pd.DataFrame(default_data)
+    df_default.to_excel(DB_FILE, index=False)
+    return df_default
+
+def save_database(df):
+    """Guarda e implementa deduplicación de semanas antes de persistir en Excel."""
+    try:
+        if not df.empty and "Fecha Inicio" in df.columns:
+            # Eliminar rigurosamente la fila dinámica de "TOTALES" para no ensuciar el Excel físico
+            df = df[df["Fecha Inicio"] != "TOTALES"]
+            df = df.drop_duplicates(subset=["Fecha Inicio"], keep="last")
+            df = df.sort_values(by="Fecha Inicio").reset_index(drop=True)
+        df.to_excel(DB_FILE, index=False)
+    except Exception as e:
+        st.error(f"Error al guardar la base de datos local: {e}")
+
+# Inicialización del estado
+if 'historical_db' not in st.session_state:
+    st.session_state.historical_db = load_database()
+
+if 'selected_index' not in st.session_state:
+    st.session_state.selected_index = 0
+
+# ----------------- PARSER INTELIGENTE DE ARCHIVOS (PDF) -----------------
+def parse_payroll_file(text):
+    data = {
+        "start_date": datetime.date(2026, 7, 6),
+        "reg_hrs": 0.0,
+        "ot_hrs": 0.0,
+        "ntp_days": 0,
+        "rate_reg": 17.0,
+        "fits": 0.0,
+        "social_security": 0.0,
+        "medicare": 0.0,
+        "deduc_401k": 0.0
+    }
+    
+    # FORMATO 1: Paycheck eAccess (Ingresos directos)
+    if "CURRENT HOURS & EARNINGS" in text or "Check Number" in text:
+        period_match = re.search(r"Pay Period:\s*([\d/]+ - [\d/]+|[\d/]+-[\d/]+)", text, re.IGNORECASE)
+        if period_match:
+            raw_p = period_match.group(1)
+            parts = raw_p.split("-")
+            if len(parts) == 2:
+                try:
+                    data["start_date"] = pd.to_datetime(parts[0].strip()).date()
+                except:
+                    pass
+        
+        reg_match = re.search(r"R\s+(\d+)\s+\$([\d\.]+)", text)
+        if reg_match:
+            data["reg_hrs"] = float(reg_match.group(1))
+            data["rate_reg"] = float(reg_match.group(2))
+            
+        ot_match = re.search(r"O\s+(\d+)\s+\$([\d\.]+)", text)
+        if ot_match:
+            data["ot_hrs"] = float(ot_match.group(1))
+            
+        ntp_match = re.search(r"NTP\s+\$([\d\.,]+)", text)
+        if ntp_match:
+            amount = float(ntp_match.group(1).replace(",", ""))
+            data["ntp_days"] = int(amount / 125.0)
+
+        fit_match = re.search(r"Federal\s+Income Tax\s+\|\s+\$([\d\.]+)", text, re.IGNORECASE)
+        if fit_match: data["fits"] = float(fit_match.group(1))
+
+        ss_match = re.search(r"Social Security\s+\|\s+\$([\d\.]+)", text, re.IGNORECASE)
+        if ss_match: data["social_security"] = float(ss_match.group(1))
+
+        med_match = re.search(r"Medicare\s+\|\s+\$([\d\.]+)", text, re.IGNORECASE)
+        if med_match: data["medicare"] = float(med_match.group(1))
+
+        k_match = re.search(r"401K\s+DEDUCTION\s+\|\s+\$([\d\.]+)", text, re.IGNORECASE)
+        if k_match: data["deduc_401k"] = float(k_match.group(1))
+
+    # FORMATO 2 y 3: TIMECARD HISTORY (Semanales o del año completo)
+    elif "TIMECARD HISTORY" in text:
+        all_dates_raw = re.findall(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text)
+        if all_dates_raw:
+            sorted_dates = sorted(list(set(all_dates_raw)), key=lambda d: pd.to_datetime(d))
+            try:
+                data["start_date"] = pd.to_datetime(sorted_dates[0]).date()
+            except:
+                pass
+
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if "NON TAX PD" in line or "NON TAX" in line:
+                data["ntp_days"] += 1
+            elif "REG" in line:
+                hrs = re.search(r"(\d+\.\d+)", line)
+                if hrs:
+                    data["reg_hrs"] += float(hrs.group(1))
+                elif i > 0:
+                    prev_hrs = re.search(r"(\d+\.\d+)", lines[i-1])
+                    if prev_hrs: data["reg_hrs"] += float(prev_hrs.group(1))
+            elif "OT" in line:
+                normalized_line = line.replace(",", ".")
+                hrs = re.search(r"(\d+\.\d+)", normalized_line)
+                if hrs:
+                    data["ot_hrs"] += float(hrs.group(1))
+                elif i > 0:
+                    normalized_prev = lines[i-1].replace(",", ".")
+                    prev_hrs = re.search(r"(\d+\.\d+)", normalized_prev)
+                    if prev_hrs: data["ot_hrs"] += float(prev_hrs.group(1))
+
+    return data
+
+# ----------------- DISEÑO DE INTERFAZ -----------------
+st.markdown("<h1 class='main-title'>Análisis de Nómina con Persistencia Automática</h1>", unsafe_allow_html=True)
+st.markdown("<p class='subtitle'>Los cambios se guardan automáticamente en tu archivo de base de datos local en tiempo real.</p>", unsafe_allow_html=True)
+
+# 1. CARGA DE ARCHIVO
+st.markdown("### 📥 Paso 1: Cargar Paycheck o Timecard (PDF)")
+uploaded_file = st.file_uploader("Arrastra tu documento aquí", type=["pdf"])
+
+extracted_vals = None
+if uploaded_file is not None:
+    try:
+        reader = PdfReader(uploaded_file)
+        full_text = "".join([page.extract_text() + "\n" for page in reader.pages])
+        extracted_vals = parse_payroll_file(full_text)
+        st.success(f"¡Documento reconocido con éxito! Fecha de inicio detectada: **{extracted_vals['start_date']}**")
+    except Exception as e:
+        st.error(f"No se pudo procesar el PDF: {e}")
+
+# Valores por defecto
+default_start_date = extracted_vals["start_date"] if extracted_vals else datetime.date(2026, 7, 6)
+default_reg = extracted_vals["reg_hrs"] if extracted_vals else 40.0
+default_ot = extracted_vals["ot_hrs"] if extracted_vals else 16.0
+default_ntp = extracted_vals["ntp_days"] if extracted_vals else 7
+default_rate = extracted_vals["rate_reg"] if extracted_vals else 17.0
+
+# 2. REGISTRO DE DATOS
+st.markdown("### 📝 Paso 2: Registrar o Modificar Datos por Fecha")
+
+col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(5)
+with col_f1:
+    fecha_inicio = st.date_input("Fecha Inicio (Lunes)", value=default_start_date)
+    fecha_fin = fecha_inicio + datetime.timedelta(days=6)
+    semana_formateada = f"{fecha_inicio.strftime('%m/%d')} al {fecha_fin.strftime('%m/%d')}"
+    st.caption(f"Semana calculada: **{semana_formateada}**")
+with col_f2:
+    reg_input = st.number_input("Horas REG", min_value=0.0, value=default_reg, step=0.5)
+with col_f3:
+    ot_input = st.number_input("Horas OT", min_value=0.0, value=default_ot, step=0.5)
+with col_f4:
+    ntp_input = st.number_input("Días de Viáticos (NTP)", min_value=0, value=int(default_ntp), step=1)
+with col_f5:
+    tarifa_input = st.number_input("Tarifa REG ($/hr)", min_value=0.0, value=default_rate, step=0.5)
+
+# Cálculos financieros automáticos
+sueldo_reg = reg_input * tarifa_input
+sueldo_ot = ot_input * (tarifa_input * 1.5)
+viaticos_ntp = ntp_input * 125.0
+gross_total = sueldo_reg + sueldo_ot + viaticos_ntp
+
+if extracted_vals and extracted_vals["fits"] > 0:
+    fits = extracted_vals["fits"]
+    ss = extracted_vals["social_security"]
+    med = extracted_vals["medicare"]
+    deduc_401k = extracted_vals["deduc_401k"]
+else:
+    base_imponible = sueldo_reg + sueldo_ot
+    fits = base_imponible * 0.0085
+    ss = base_imponible * 0.0620
+    med = base_imponible * 0.0145
+    deduc_401k = base_imponible * 0.0400
+
+total_impuestos = fits + ss + med
+net_pay_calc = gross_total - total_impuestos - deduc_401k
+
+if st.button("💾 Guardar / Actualizar esta semana en el Historial"):
+    new_data = {
+        "Fecha Inicio": str(fecha_inicio),
+        "Fecha Fin": str(fecha_fin),
+        "Semana": semana_formateada,
+        "Hrs REG": reg_input,
+        "Hrs OT": ot_input,
+        "Días NTP": int(ntp_input),
+        "Tarifa REG": tarifa_input,
+        "Sueldo REG": sueldo_reg,
+        "Sueldo OT": sueldo_ot,
+        "Viáticos NTP": viaticos_ntp,
+        "Pago Bruto (Gross)": gross_total,
+        "Impuestos": total_impuestos,
+        "Deducción 401-K": deduc_401k,
+        "Neto Recibido": net_pay_calc
+    }
+    df_temp = st.session_state.historical_db.copy()
+    
+    # Evitar duplicaciones
+    df_temp = df_temp[df_temp["Fecha Inicio"] != str(fecha_inicio)]
+    df_final = pd.concat([df_temp, pd.DataFrame([new_data])], ignore_index=True)
+    df_final = df_final.sort_values(by="Fecha Inicio").reset_index(drop=True)
+    
+    st.session_state.historical_db = df_final
+    save_database(df_final)
+    st.success(f"¡Semana '{semana_formateada}' guardada sin duplicados!")
+
+# ----------------- SECCIÓN 3: EXPLORADOR POR PÍLDORAS -----------------
+st.markdown("---")
+st.markdown("### 🗓️ Panel de Control Temporal")
+
+# Limpieza preventiva para los selectores temporales
+db_clean_for_pills = st.session_state.historical_db[st.session_state.historical_db["Fecha Inicio"] != "TOTALES"]
+
+if not db_clean_for_pills.empty:
+    db_ordenada = db_clean_for_pills.sort_values("Fecha Inicio").reset_index(drop=True)
+    semanas_lista = list(db_ordenada["Semana"].unique())
+    max_idx = len(semanas_lista) - 1
+    
+    if st.session_state.selected_index > max_idx:
+        st.session_state.selected_index = max_idx
+
+    col_nav1, col_nav2, col_nav3 = st.columns([1, 6, 1])
+    
+    with col_nav1:
+        if st.button("◀ Anterior", use_container_width=True, disabled=(st.session_state.selected_index == 0)):
+            st.session_state.selected_index -= 1
+            st.rerun()
+            
+    with col_nav2:
+        semana_seleccionada = st.pills(
+            "Selecciona directamente una semana:",
+            options=semanas_lista,
+            default=semanas_lista[st.session_state.selected_index],
+            selection_mode="single"
+        )
+        
+        if semana_seleccionada and semana_seleccionada in semanas_lista:
+            st.session_state.selected_index = semanas_lista.index(semana_seleccionada)
+        else:
+            semana_seleccionada = semanas_lista[st.session_state.selected_index]
+            
+    with col_nav3:
+        if st.button("Siguiente ▶", use_container_width=True, disabled=(st.session_state.selected_index == max_idx)):
+            st.session_state.selected_index += 1
+            st.rerun()
+
+    datos_semana = db_ordenada[db_ordenada["Semana"] == semana_seleccionada].iloc[0]
+    
+    col_m1, col_m2, col_m3 = st.columns(3)
+    with col_m1:
+        st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">INGRESO BRUTO (GROSS)</div>
+                <div class="metric-val">${datos_semana['Pago Bruto (Gross)']:,.2f}</div>
+                <div style="font-size:11px; color:#595959; margin-top:5px;">
+                    REG: ${datos_semana['Sueldo REG']:.2f} | OT: ${datos_semana['Sueldo OT']:.2f} | NTP: ${datos_semana['Viáticos NTP']:.2f}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    with col_m2:
+        st.markdown(f"""
+            <div class="metric-card" style="border-top-color: #2E7D32;">
+                <div class="metric-label" style="color:#2E7D32;">INGRESO NETO (NET PAY)</div>
+                <div class="metric-val" style="color:#2E7D32;">${datos_semana['Neto Recibido']:,.2f}</div>
+                <div style="font-size:11px; color:#595959; margin-top:5px;">
+                    Monto depositado en tu cuenta
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    with col_m3:
+        st.markdown(f"""
+            <div class="metric-card" style="border-top-color: #C62828;">
+                <div class="metric-label" style="color:#C62828;">TOTAL RETENCIONES</div>
+                <div class="metric-val" style="color:#C62828;">${(datos_semana['Impuestos'] + datos_semana['Deducción 401-K']):,.2f}</div>
+                <div style="font-size:11px; color:#595959; margin-top:5px;">
+                    Impuestos: ${datos_semana['Impuestos']:.2f} | 401K: ${datos_semana['Deducción 401-K']:.2f}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+else:
+    st.info("No hay semanas en el historial para mostrar.")
+
+# ----------------- SECCIÓN 4: BASE DE DATOS Y GRÁFICOS -----------------
+st.markdown("---")
+tab1, tab2 = st.tabs(["🗃️ Base de Datos Histórica (Autoguardado)", "📊 Gráficos Interactivos de Alto Nivel"])
+
+with tab1:
+    if not st.session_state.historical_db.empty:
+        df_db = st.session_state.historical_db.copy()
+        df_db = df_db[df_db["Fecha Inicio"] != "TOTALES"]
+
+        # Calcular totales dinámicos acumulados del año
+        tot_hrs_reg = df_db["Hrs REG"].sum()
+        tot_hrs_ot = df_db["Hrs OT"].sum()
+        tot_viaticos = df_db["Viáticos NTP"].sum()
+        tot_gross = df_db["Pago Bruto (Gross)"].sum()
+        tot_impuestos = df_db["Impuestos"].sum()
+        tot_401k = df_db["Deducción 401-K"].sum()
+        tot_neto = df_db["Neto Recibido"].sum()
+        
+        st.markdown("### 📊 Totales Acumulados del Año")
+        col_t1, col_t2, col_t3, col_t4, col_t5 = st.columns(5)
+        with col_t1:
+            st.markdown(f"""
+                <div class="annual-card">
+                    <div class="annual-label">Total Horas (REG / OT)</div>
+                    <div class="annual-val">{tot_hrs_reg:,.1f}h / {tot_hrs_ot:,.1f}h</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col_t2:
+            st.markdown(f"""
+                <div class="annual-card">
+                    <div class="annual-label">Total Bruto (Gross)</div>
+                    <div class="annual-val" style="color:#1F497D;">${tot_gross:,.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col_t3:
+            st.markdown(f"""
+                <div class="annual-card" style="border-left-color: #2E7D32;">
+                    <div class="annual-label" style="color:#2E7D32;">Total Neto (Net Pay)</div>
+                    <div class="annual-val" style="color:#2E7D32;">${tot_neto:,.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col_t4:
+            st.markdown(f"""
+                <div class="annual-card" style="border-left-color: #F2A900;">
+                    <div class="annual-label" style="color:#B8860B;">Total Viáticos (NTP)</div>
+                    <div class="annual-val" style="color:#B8860B;">${tot_viaticos:,.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col_t5:
+            st.markdown(f"""
+                <div class="annual-card" style="border-left-color: #C62828;">
+                    <div class="annual-label" style="color:#C62828;">Deducciones (Tax + 401k)</div>
+                    <div class="annual-val" style="color:#C62828;">${(tot_impuestos + tot_401k):,.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # --- FILA DE TOTALES DINÁMICA ---
+        total_row = pd.DataFrame([{
+            "Fecha Inicio": "TOTALES",
+            "Fecha Fin": "---",
+            "Semana": "TOTALES",
+            "Hrs REG": tot_hrs_reg,
+            "Hrs OT": tot_hrs_ot,
+            "Días NTP": int(df_db["Días NTP"].sum()),
+            "Tarifa REG": None,  # No totalizable
+            "Sueldo REG": df_db["Sueldo REG"].sum(),
+            "Sueldo OT": df_db["Sueldo OT"].sum(),
+            "Viáticos NTP": tot_viaticos,
+            "Pago Bruto (Gross)": tot_gross,
+            "Impuestos": tot_impuestos,
+            "Deducción 401-K": tot_401k,
+            "Neto Recibido": tot_neto
+        }])
+
+        # Unimos la fila de Totales para que aparezca elegantemente en la base de la tabla
+        df_for_editor = pd.concat([df_db, total_row], ignore_index=True)
+
+        st.markdown("### 🛠️ Editor de Base de Datos Interactiva")
+        st.write("Modifica o corrige valores directamente en la tabla. Los totales se recalcularán al instante.")
+        
+        # --- CONFIGURACIÓN DE COLUMNAS DE STREAMLIT PARA ACABADO PROFESIONAL ---
+        # Convierte números planos en campos interactivos elegantes con símbolos, decimales y formatos de moneda.
+        column_configuration = {
+            "Fecha Inicio": st.column_config.TextColumn("Fecha Inicio", help="Fecha del lunes de inicio", disabled=True),
+            "Fecha Fin": st.column_config.TextColumn("Fecha Fin", disabled=True),
+            "Semana": st.column_config.TextColumn("Semana", disabled=True),
+            "Hrs REG": st.column_config.NumberColumn("Horas REG", format="%.1f hrs", min_value=0),
+            "Hrs OT": st.column_config.NumberColumn("Horas OT", format="%.1f hrs", min_value=0),
+            "Días NTP": st.column_config.NumberColumn("Días NTP (Viáticos)", format="%d días", min_value=0),
+            "Tarifa REG": st.column_config.NumberColumn("Tarifa $/hr", format="$%.2f"),
+            "Sueldo REG": st.column_config.NumberColumn("Sueldo REG", format="$%.2f", disabled=True),
+            "Sueldo OT": st.column_config.NumberColumn("Sueldo OT", format="$%.2f", disabled=True),
+            "Viáticos NTP": st.column_config.NumberColumn("Viáticos NTP", format="$%.2f", disabled=True),
+            "Pago Bruto (Gross)": st.column_config.NumberColumn("Pago Bruto (Gross)", format="$%.2f", disabled=True),
+            "Impuestos": st.column_config.NumberColumn("Impuestos", format="$%.2f"),
+            "Deducción 401-K": st.column_config.NumberColumn("401-K", format="$%.2f"),
+            "Neto Recibido": st.column_config.NumberColumn("Neto Recibido", format="$%.2f", disabled=True),
+        }
+
+        edited_db = st.data_editor(
+            df_for_editor,
+            column_config=column_configuration,
+            num_rows="dynamic",
+            key="db_editor",
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # Eliminar estrictamente la fila "TOTALES" recalculada antes de guardar el archivo de Excel
+        clean_edited = edited_db[edited_db["Fecha Inicio"] != "TOTALES"]
+        
+        # Si el usuario modificó alguna celda, recalculamos los sueldos y actualizamos la base de datos física
+        if not clean_edited.equals(df_db):
+            # Recálculos automáticos de seguridad sobre las filas modificadas
+            for idx, row in clean_edited.iterrows():
+                tarifa = row["Tarifa REG"] if pd.notnull(row["Tarifa REG"]) else 17.0
+                clean_edited.at[idx, "Sueldo REG"] = row["Hrs REG"] * tarifa
+                clean_edited.at[idx, "Sueldo OT"] = row["Hrs OT"] * (tarifa * 1.5)
+                clean_edited.at[idx, "Viáticos NTP"] = row["Días NTP"] * 125.0
+                
+                # Re-cálculo de totales financieros por fila
+                nuevo_gross = clean_edited.at[idx, "Sueldo REG"] + clean_edited.at[idx, "Sueldo OT"] + clean_edited.at[idx, "Viáticos NTP"]
+                clean_edited.at[idx, "Pago Bruto (Gross)"] = nuevo_gross
+                
+                impuestos_actuales = row["Impuestos"] if pd.notnull(row["Impuestos"]) else (nuevo_gross * 0.08)
+                deduc_401k_actual = row["Deducción 401-K"] if pd.notnull(row["Deducción 401-K"]) else 0.0
+                clean_edited.at[idx, "Neto Recibido"] = nuevo_gross - impuestos_actuales - deduc_401k_actual
+
+            st.session_state.historical_db = clean_edited
+            save_database(clean_edited)
+            st.toast("💾 ¡Base de datos y totales actualizados automáticamente!")
+            st.rerun()
+            
+    col_b1, col_b2 = st.columns([1, 4])
+    with col_b1:
+        if st.button("🗑️ Eliminar Todo", type="primary"):
+            st.session_state.historical_db = pd.DataFrame(columns=st.session_state.historical_db.columns)
+            save_database(st.session_state.historical_db)
+            st.rerun()
+            
+    with col_b2:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            clean_download = st.session_state.historical_db[st.session_state.historical_db["Fecha Inicio"] != "TOTALES"]
+            clean_download.to_excel(writer, index=False, sheet_name="Consolidado")
+        
+        st.download_button(
+            label="📥 Descargar Base de Datos Completa (Excel)",
+            data=output.getvalue(),
+            file_name="historial_nomina.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+with tab2:
+    if not db_clean_for_pills.empty:
+        df_chart = db_clean_for_pills.copy().sort_values("Fecha Inicio")
+        
+        col_g1, col_g2 = st.columns(2)
+        
+        with col_g1:
+            st.markdown("#### 📈 Tendencia de Ingresos Semanales")
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=df_chart["Semana"], y=df_chart["Pago Bruto (Gross)"],
+                mode='lines+markers', name='Ingreso Bruto (Gross)',
+                line=dict(color='#1F497D', width=3),
+                hovertemplate='Gross: $%{y:,.2f}'
+            ))
+            fig_trend.add_trace(go.Scatter(
+                x=df_chart["Semana"], y=df_chart["Neto Recibido"],
+                mode='lines+markers', name='Ingreso Neto (Net)',
+                line=dict(color='#2E7D32', width=3),
+                hovertemplate='Net: $%{y:,.2f}'
+            ))
+            fig_trend.update_layout(
+                margin=dict(l=20, r=20, t=30, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=True, gridcolor="#EAEAEA"),
+                yaxis=dict(showgrid=True, gridcolor="#EAEAEA")
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+        with col_g2:
+            st.markdown(f"#### 🍩 Destino del Ingreso Bruto ({semana_seleccionada})")
+            labels_pie = ["Neto Recibido", "Impuestos", "Plan 401-K"]
+            valores_pie = [datos_semana["Neto Recibido"], datos_semana["Impuestos"], datos_semana["Deducción 401-K"]]
+            
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=labels_pie, 
+                values=valores_pie, 
+                hole=.4,
+                marker=dict(colors=['#2E7D32', '#C62828', '#F2A900'])
+            )])
+            fig_pie.update_layout(
+                margin=dict(l=20, r=20, t=30, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5)
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        st.markdown("#### ⏱️ Evolución de Horas Trabajadas")
+        fig_hours = px.bar(
+            df_chart, 
+            x="Semana", 
+            y=["Hrs REG", "Hrs OT"],
+            barmode="group",
+            color_discrete_map={"Hrs REG": "#1F497D", "Hrs OT": "#F2A900"},
+            labels={"value": "Horas", "variable": "Tipo de Hora"}
+        )
+        fig_hours.update_layout(
+            margin=dict(l=20, r=20, t=20, b=20),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_hours, use_container_width=True)
+        
+    else:
+        st.info("No hay datos para generar gráficos.")
